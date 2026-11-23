@@ -5,24 +5,32 @@ import os
 from pathlib import Path
 import re
 import shutil
-import subprocess
 import signal
+import subprocess
 import uuid
 
 import bpy
-from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty
 from bpy.types import AddonPreferences, CompositorNodeCustomGroup, Operator
 
-from . import mps_backend, setup_ui
-from .sequences import KEYED_FRAMES, RAW_FOREGROUND, SEQUENCE_NODES
+from . import mlx_backend as backend
+from . import setup_ui
+from .sequences import FOREGROUND_OUTPUTS, KEYED_FRAMES, SEQUENCE_NODES
 
 ADDON_ID = __package__
-NODE_ID = "CompositorNodeCorridorKeyMPS"
-NODE_LABEL = "CorridorKey2.0 (MPS)"
+NODE_ID = "CompositorNodeCorridorKeyMLX"
+NODE_LABEL = "CorridorKey2.0 (MLX)"
 JOBS = {}
 ANALYSIS_BUSY_MESSAGE = "Wait for analysis to finish."
-MORE_OUTPUTS = ("Matte", RAW_FOREGROUND, "Edges")
+MORE_OUTPUTS = ("Matte", *FOREGROUND_OUTPUTS, "Edges")
 ALPHA_HINT = "Alpha Hint"
+HINT_CONFIDENCE = "Alpha Hint Confidence"
+HINT_FRAMES = "Hint Frames"
+DESPILL_STRENGTH = "Despill Strength"
+FIRST_FRAME = "First Frame"
+ALL_FRAMES = "All Frames"
+ANALYSIS_SETTINGS = "Analysis Settings"
+HINT_DESCRIPTION = "Rough alpha for Start Frame or every analyzed frame. A white overlay previews the hint."
 GARBAGE_MASK = "Garbage Mask"
 PREVIEW_NODE = "Mask Preview"
 BAKE_PROGRESS = re.compile(rb"^Bake (\d+)/(\d+)$", re.MULTILINE)
@@ -97,15 +105,11 @@ def bake_cache_directory(tree):
     if not isinstance(destination, str) or Path(destination).parts[-2:] != (job.name, "baked-input"):
         return None
 
-    expected = {
-        (sequence.node_name, sequence.folder, sequence.extension)
-        for sequence in mps_backend.output_sequences(result)
-    }
-    for name in SEQUENCE_NODES:
-        image = tree.nodes[name].image
+    for sequence in backend.output_sequences(result):
+        image = tree.nodes[sequence.node_name].image
         if image:
             path = image_path(image)
-            if (name, path.parent, path.suffix) not in expected:
+            if path.parent != sequence.folder or path.suffix != sequence.extension:
                 return None
     return job
 
@@ -113,9 +117,8 @@ def bake_cache_directory(tree):
 class CorridorKeyPreferences(AddonPreferences):
     bl_idname = ADDON_ID
 
-    mps_python: StringProperty(name="MPS Python", subtype="FILE_PATH")
-    mps_checkout: StringProperty(name="CorridorKey 2.0 folder", subtype="DIR_PATH")
-    mps_ffmpeg: StringProperty(name="FFmpeg executable", subtype="FILE_PATH", description="Optional when FFmpeg is on PATH")
+    executable: StringProperty(name="MLX executable", subtype="FILE_PATH")
+    model_root: StringProperty(name="FP16 model folder", subtype="DIR_PATH")
     cache_root: StringProperty(name="Cache folder", subtype="DIR_PATH")
     delete_cache_on_clear: BoolProperty(
         name="Delete Cache Files on Clear Bake",
@@ -131,9 +134,8 @@ class CorridorKeyPreferences(AddonPreferences):
         row.alignment = "LEFT"
         row.prop(self, "show_advanced", emboss=False, icon="TRIA_DOWN" if self.show_advanced else "TRIA_RIGHT")
         if self.show_advanced:
-            layout.prop(self, "mps_python")
-            layout.prop(self, "mps_checkout")
-            layout.prop(self, "mps_ffmpeg")
+            layout.prop(self, "executable")
+            layout.prop(self, "model_root")
             layout.prop(self, "cache_root")
             layout.prop(self, "delete_cache_on_clear")
 
@@ -142,17 +144,16 @@ class CorridorKeyNode(CompositorNodeCustomGroup):
     bl_idname = NODE_ID
     bl_label = NODE_LABEL
 
-    temporal: EnumProperty(
-        name="Time Awareness", default="AUTO",
-        items=(
-            ("AUTO", "Automatic", "Choose a window based on available memory"),
-            ("1", "Single Frame", "Use one frame per Stage 1 window"),
-            ("4", "Four Frames", "Use four-frame Stage 1 windows with a two-frame stride"),
-        ),
+    screen: EnumProperty(
+        name="Screen",
+        items=backend.SCREEN_ITEMS,
     )
-    despill_strength: FloatProperty(name="Despill Strength", default=0.5, min=0.0, max=1.0, subtype="FACTOR")
     start_frame: IntProperty(name="Start Frame", default=1, update=set_start_frame)
     bake_end: IntProperty(name="End Frame", default=1)
+    profile: EnumProperty(
+        name="Model resolution",
+        items=backend.PROFILE_ITEMS,
+    )
     status: StringProperty()
 
     def init(self, context):
@@ -171,6 +172,8 @@ class CorridorKeyNode(CompositorNodeCustomGroup):
         add_mask_preview(tree)
         update_image_output(tree)
         self.node_tree = tree
+        self.inputs[HINT_FRAMES].default_value = FIRST_FRAME
+        self.outputs[ANALYSIS_SETTINGS].hide = True
         self.width = 245
 
     def copy(self, source_node):
@@ -188,22 +191,24 @@ class CorridorKeyNode(CompositorNodeCustomGroup):
 
     def draw_buttons(self, context, layout):
         job = JOBS.get(self.as_pointer())
+        baked = has_bake(self)
         fields = layout.column()
-        fields.enabled = job is None and not has_bake(self)
+        fields.enabled = job is None and not baked
         linked = image_is_linked(self)
-        fields.label(text="Green screen · Scene resolution")
-        fields.prop(self, "temporal")
-        fields.prop(self, "despill_strength", slider=True)
+        for property_name, label in (("screen", "Screen"), ("profile", "Model resolution")):
+            field = fields.split(factor=0.52, align=True)
+            field.label(text=label)
+            field.prop(self, property_name, text="")
         fields.prop(self, "start_frame")
         fields.prop(self, "bake_end")
         if job:
-            layout.operator("node.corridorkey_mps_cancel", text="Cancel").node_name = self.name
+            layout.operator("node.corridorkey_mlx_cancel", text="Cancel").node_name = self.name
             if job.progress is None:
                 layout.label(text=job.message)
             else:
                 layout.progress(factor=job.progress, type="BAR", text=job.message)
-        elif has_bake(self):
-            layout.operator("node.corridorkey_mps_clear_bake", text="Clear Bake").node_name = self.name
+        elif baked:
+            layout.operator("node.corridorkey_mlx_clear_bake", text="Clear Bake").node_name = self.name
             if self.status:
                 layout.label(text=self.status)
         else:
@@ -211,7 +216,7 @@ class CorridorKeyNode(CompositorNodeCustomGroup):
             row = layout.row()
             row.enabled = linked and not busy
             row.operator(
-                "node.corridorkey_mps_analyze",
+                "node.corridorkey_mlx_analyze",
                 text=ANALYSIS_BUSY_MESSAGE if busy else "Analyze",
             ).node_name = self.name
             if self.status and not busy:
@@ -220,7 +225,7 @@ class CorridorKeyNode(CompositorNodeCustomGroup):
 
 def add_processing_sockets(tree):
     for name, description in (
-        (ALPHA_HINT, "Rough alpha for the first analyzed frame. A white overlay previews the foreground hint."),
+        (ALPHA_HINT, HINT_DESCRIPTION),
         (GARBAGE_MASK, "White keeps the foreground. The preview darkens excluded areas before analysis."),
     ):
         socket = tree.interface.new_socket(
@@ -229,6 +234,7 @@ def add_processing_sockets(tree):
         socket.hide_value = True
         socket.default_value = 1 if name == GARBAGE_MASK else 0
     for name, socket_type in (
+        ("Despilled Foreground", "NodeSocketColor"),
         ("Raw Foreground", "NodeSocketColor"),
         ("Edges", "NodeSocketFloat"),
     ):
@@ -266,9 +272,10 @@ def add_processing_sockets(tree):
         links.new(boundary.outputs["Mask"], edges.inputs[index])
     links.new(edges.outputs[0], output.inputs["Edges"])
 
-    foreground = nodes.new("CompositorNodeImage")
-    foreground.name = RAW_FOREGROUND
-    links.new(foreground.outputs["Image"], output.inputs[RAW_FOREGROUND])
+    for name in FOREGROUND_OUTPUTS:
+        foreground = nodes.new("CompositorNodeImage")
+        foreground.name = name
+        links.new(foreground.outputs["Image"], output.inputs[name])
 
 
 def organize_sockets(tree):
@@ -277,10 +284,63 @@ def organize_sockets(tree):
         (item.in_out, item.name): item for item in interface.items_tree
         if item.item_type == "SOCKET"
     }
-    panel = interface.new_panel("More", default_closed=True)
+    more = interface.new_panel("More", default_closed=True)
     for index, name in enumerate(MORE_OUTPUTS):
-        interface.move_to_parent(sockets["OUTPUT", name], panel, index)
-    interface.move_to_parent(sockets["INPUT", ALPHA_HINT], panel, len(MORE_OUTPUTS))
+        interface.move_to_parent(sockets["OUTPUT", name], more, index)
+    interface.move_to_parent(sockets["INPUT", ALPHA_HINT], more, len(MORE_OUTPUTS))
+    add_analysis_controls(tree, sockets["INPUT", ALPHA_HINT])
+    items = {item.name: item for item in more.interface_items}
+    for label, names in (
+        ("Additional Outputs", (*MORE_OUTPUTS, ANALYSIS_SETTINGS)),
+        ("Alpha Hint Settings", (ALPHA_HINT, HINT_CONFIDENCE, HINT_FRAMES)),
+    ):
+        panel = interface.new_panel(label, default_closed=True)
+        interface.move_to_parent(panel, more, len(more.interface_items))
+        for position, name in enumerate(names):
+            interface.move_to_parent(items[name], panel, position)
+
+
+def add_analysis_controls(tree, hint):
+    interface = tree.interface
+    for offset, (name, default, description) in enumerate((
+        (HINT_CONFIDENCE, 0.8, "How strongly the model follows Alpha Hint during analysis"),
+        (HINT_FRAMES, None, "Sample the hint at Start Frame or at every analyzed frame"),
+        (DESPILL_STRENGTH, 1.0, "How much green or blue spill to remove during analysis. Clear the bake to change it."),
+    ), start=1):
+        socket = interface.new_socket(
+            name=name, in_out="INPUT",
+            socket_type="NodeSocketMenu" if default is None else "NodeSocketFloat",
+            description=description,
+        )
+        if default is not None:
+            socket.subtype = "FACTOR"
+            socket.min_value = 0.0
+            socket.max_value = 1.0
+            socket.default_value = default
+        interface.move_to_parent(socket, hint.parent, hint.position + offset)
+
+    # Connect the bake options to a private output so Blender keeps their
+    # native controls active without routing their values into the image.
+    settings_output = interface.new_socket(name=ANALYSIS_SETTINGS, in_out="OUTPUT", socket_type="NodeSocketVector")
+    interface.move_to_parent(settings_output, hint.parent, len(hint.parent.interface_items))
+    nodes, links = tree.nodes, tree.links
+    group_input = next(n for n in nodes if n.type == "GROUP_INPUT")
+    group_output = next(n for n in nodes if n.type == "GROUP_OUTPUT" and n.is_active_output)
+    menu = nodes.new("GeometryNodeMenuSwitch")
+    menu.data_type = "FLOAT"
+    for item, label in zip(menu.enum_items, (FIRST_FRAME, ALL_FRAMES), strict=True):
+        item.name = label
+    menu.inputs[FIRST_FRAME].default_value = 0.0
+    menu.inputs[ALL_FRAMES].default_value = 1.0
+    links.new(group_input.outputs[HINT_FRAMES], menu.inputs["Menu"])
+    menu.inputs["Menu"].default_value = FIRST_FRAME
+    interface.items_tree[HINT_FRAMES].default_value = FIRST_FRAME
+    settings = nodes.new("ShaderNodeCombineXYZ")
+    settings.label = ANALYSIS_SETTINGS
+    links.new(group_input.outputs[HINT_CONFIDENCE], settings.inputs["X"])
+    links.new(menu.outputs[0], settings.inputs["Y"])
+    links.new(group_input.outputs[DESPILL_STRENGTH], settings.inputs["Z"])
+    links.new(settings.outputs[0], group_output.inputs[ANALYSIS_SETTINGS])
 
 
 def add_preview_mix(tree, label):
@@ -329,15 +389,31 @@ def update_image_output(tree):
     keyed = tree.nodes[KEYED_FRAMES]
     output = next(node for node in tree.nodes if node.type == "GROUP_OUTPUT" and node.is_active_output)
     image_input = output.inputs["Image"]
-    if keyed.image:
-        source = tree.nodes["Masked Image"].outputs["Image"]
-    elif preview := tree.nodes.get(PREVIEW_NODE):
-        source = preview.outputs["Image"]
-    else:
-        group_input = next(node for node in tree.nodes if node.type == "GROUP_INPUT")
-        source = group_input.outputs["Image"]
+    source = tree.nodes["Masked Image" if keyed.image else PREVIEW_NODE].outputs["Image"]
     if not any(link.from_socket == source for link in image_input.links):
         tree.links.new(source, image_input)
+    sync_analysis_controls(tree)
+
+
+def sync_analysis_controls(tree):
+    output = next(node for node in tree.nodes if node.type == "GROUP_OUTPUT" and node.is_active_output)
+    target = output.inputs.get(ANALYSIS_SETTINGS)
+    if target is None:
+        return
+    # Blender dims unused group inputs. The private settings link controls
+    # editability while preserving the values and the dropdown's menu definition.
+    if tree.nodes[KEYED_FRAMES].image is not None:
+        if target.is_linked:
+            tree.links.remove(target.links[0])
+        return
+    settings = next(
+        (node for node in tree.nodes if node.bl_idname == "ShaderNodeCombineXYZ" and node.label == ANALYSIS_SETTINGS),
+        None,
+    )
+    if settings is None:
+        return
+    if not target.is_linked:
+        tree.links.new(settings.outputs[0], target)
 
 
 def image_input_link(node, require_valid=True, socket_name="Image"):
@@ -352,6 +428,12 @@ def image_input_link(node, require_valid=True, socket_name="Image"):
 
 def image_is_linked(node):
     return image_input_link(node) is not None
+
+
+def analysis_setting(node, name):
+    if image_input_link(node, socket_name=name):
+        raise ValueError(f"Disconnect the {name} input and set it under More.")
+    return node.inputs[name].default_value
 
 
 def strip_compositor(scene, tree):
@@ -414,12 +496,18 @@ def bake_config(context, node, destination, bake_size):
         "destination": str(destination / "baked-input"),
         "source_node": link.from_node.name,
         "source_socket": link.from_socket.identifier,
+        "despill_strength": analysis_setting(node, DESPILL_STRENGTH),
     }
-    if hint := image_input_link(node, socket_name=ALPHA_HINT):
+    hint = image_input_link(node, socket_name=ALPHA_HINT)
+    confidence = analysis_setting(node, HINT_CONFIDENCE) if hint else 0.0
+    if confidence > 0:
+        every_frame = analysis_setting(node, HINT_FRAMES) == ALL_FRAMES
         config["hint"] = {
             "node": hint.from_node.name,
             "socket": hint.from_socket.identifier,
-            "path": str(destination / "matte-hint.png"),
+            "path": str(destination / ("matte-hints" if every_frame else "matte-hint.png")),
+            "every_frame": every_frame,
+            "confidence": confidence,
         }
     strip, modifier = strip_compositor(scene, tree)
     if strip:
@@ -442,27 +530,8 @@ def get_node(context, name):
     return node if node and node.bl_idname == NODE_ID else None
 
 
-def prepare_analysis(context, node, prefs, destination):
-    python, checkout, ffmpeg = setup_ui.analysis_paths(prefs)
-    mps_backend.validate_runtime(python, checkout, ffmpeg)
-    render = context.scene.render
-    percent = render.resolution_percentage
-    bake_size = (max(4, render.resolution_x * percent // 100), max(4, render.resolution_y * percent // 100))
-    config = bake_config(context, node, destination, bake_size)
-    if config["context"] == "strip":
-        config["python"] = str(python)
-    config["linear_color_space"] = mps_backend.LINEAR_COLOR_SPACE
-    config["time_awareness"] = node.temporal
-    config["despill_strength"] = node.despill_strength
-    output = destination / "result"
-    command = mps_backend.analysis_command(
-        python, checkout, ffmpeg, config, output, render.fps / render.fps_base, node.temporal, node.despill_strength,
-    )
-    return config, command, mps_backend.output_sequences(output)
-
-
 class CorridorKeyAnalyze(Operator):
-    bl_idname = "node.corridorkey_mps_analyze"
+    bl_idname = "node.corridorkey_mlx_analyze"
     bl_label = "Analyze with CorridorKey"
     bl_description = "Analyze the connected image and bake the keyed frames"
 
@@ -486,8 +555,17 @@ class CorridorKeyAnalyze(Operator):
         self.process = None
         self.snapshot = None
         try:
+            executable, model_root = setup_ui.analysis_paths(prefs)
+            backend.validate_runtime(executable, model_root, node.profile)
             destination = cache_root(prefs) / uuid.uuid4().hex
-            config, self.analysis_command, self.sequences = prepare_analysis(context, node, prefs, destination)
+            config = bake_config(context, node, destination, backend.bake_size(node.profile))
+            if config["context"] == "strip":
+                config["python"] = str(backend.geometry_python(executable))
+            output = destination / "result"
+            self.sequences = backend.output_sequences(output)
+            self.analysis_command = backend.analysis_command(
+                executable, model_root, config, output, node.screen, node.profile,
+            )
             destination.mkdir(parents=True)
             self.destination = destination
             self.log = destination / "analysis.log"
@@ -529,8 +607,8 @@ class CorridorKeyAnalyze(Operator):
     def launch(self, command):
         with self.log.open("ab") as log:
             self.process = subprocess.Popen(
-                command, stdout=log, stderr=subprocess.STDOUT, cwd=self.destination,
-                start_new_session=True,
+                command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                cwd=self.destination,
             )
 
     def remove_snapshot(self):
@@ -579,7 +657,7 @@ class CorridorKeyAnalyze(Operator):
                 matches = BAKE_PROGRESS.findall(data)
                 progress = (1, "Baking input", *map(int, matches[-1])) if matches else None
             else:
-                progress = mps_backend.read_progress(data)
+                progress = backend.read_progress(data)
             if progress is not None:
                 step, label, current, total = progress
                 self.progress = min(current / max(total, 1), 1.0)
@@ -628,7 +706,7 @@ class CorridorKeyAnalyze(Operator):
 
 
 class CorridorKeyCancel(Operator):
-    bl_idname = "node.corridorkey_mps_cancel"
+    bl_idname = "node.corridorkey_mlx_cancel"
     bl_label = "Cancel CorridorKey analysis"
 
     node_name: StringProperty()
@@ -642,7 +720,7 @@ class CorridorKeyCancel(Operator):
 
 
 class CorridorKeyClearBake(Operator):
-    bl_idname = "node.corridorkey_mps_clear_bake"
+    bl_idname = "node.corridorkey_mlx_clear_bake"
     bl_label = "Clear Bake"
     bl_description = "Clear this node's bake and return to the source preview. See preferences for cache deletion"
     bl_options = {"UNDO"}

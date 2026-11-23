@@ -19,6 +19,7 @@ PYTHON_URL = (
 PYTHON_HASH = "e23fe5b16926de1d81661b1a97352e89fb167549c55a6825796ccd0f32ec7f1b"
 REVISION = "485f5e9ab759ead6138cc990776184b59d6ea971"
 MODEL_REVISION = "cf44a8db3f024bb49fd59daa408848ccf05f7477"
+UTILS3D_REVISION = "83bfa5bda008803f6521ce9547f94023b8afeddd"
 BACKEND_URL = f"https://codeload.github.com/nikopueringer/CorridorKey2.0/tar.gz/{REVISION}"
 FFMPEG_RELEASE = "ffmpeg-8.1.2-essentials_build"
 FFMPEG_URL = f"https://github.com/GyanD/codexffmpeg/releases/download/8.1.2/{FFMPEG_RELEASE}.zip"
@@ -110,13 +111,18 @@ def install(root):
 
     print("SETUP 2 Installing PyTorch and checking the NVIDIA GPU", flush=True)
     if not dependencies_ready.is_file():
+        requirements = root / "requirements.txt"
+        requirements.write_text((checkout / "requirements.txt").read_text(encoding="utf-8").replace(
+            f"git+https://github.com/EasternJournalist/utils3d.git@{UTILS3D_REVISION}",
+            f"https://codeload.github.com/EasternJournalist/utils3d/tar.gz/{UTILS3D_REVISION}",
+        ), encoding="utf-8")
         run(python, "-I", "-m", "ensurepip", "--upgrade")
         pip = (python, "-I", "-m", "pip", "--isolated", "--disable-pip-version-check")
         options = ("--cache-dir", root / "pip-cache", "--timeout", "45", "--retries", "4")
         run(*pip, "install", *options, "--index-url", "https://download.pytorch.org/whl/cu128",
             "torch==2.9.1+cu128", "torchvision==0.24.1+cu128")
         run(*pip, "install", *options, "--index-url", "https://pypi.org/simple",
-            "-r", checkout / "requirements.txt", "torch==2.9.1+cu128", "torchvision==0.24.1+cu128")
+            "-r", requirements, "torch==2.9.1+cu128", "torchvision==0.24.1+cu128")
         run(*pip, "check")
         dependencies_ready.touch()
     run(python, "-I", "-c",

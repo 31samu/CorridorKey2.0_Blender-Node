@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tarfile
+import tempfile
 import sys
 
 PYTHON_URL = (
@@ -161,6 +162,40 @@ def install(root):
     shutil.rmtree(root / "pip-cache", ignore_errors=True)
 
 
+def build_native_attention(root):
+    paths = installed_paths(root)
+    if paths is None:
+        raise RuntimeError("Set up the MPS runtime before building native attention.")
+    python, checkout, _ = paths
+    print("SETUP 1 Building native MPSGraph attention with Xcode", flush=True)
+    with tempfile.TemporaryDirectory(dir=root, prefix="native-attention-") as directory:
+        staging = Path(directory)
+        source = Path("corridorkey/native")
+        (staging / source).mkdir(parents=True)
+        (staging / "scripts").mkdir()
+        builder = Path("scripts/build_mps_attention.py")
+        loader = Path("corridorkey/mps_attention.py")
+        for relative in (source / "mps_attention.mm", builder, loader):
+            shutil.copy2(checkout / relative, staging / relative)
+        subprocess.run([python, "-I", staging / builder], check=True, cwd=staging)
+        print("SETUP 2 Verifying native MPSGraph attention on the GPU", flush=True)
+        subprocess.run([
+            python, "-I", "-c",
+            "import runpy, sys, torch; "
+            "prepare = runpy.run_path(sys.argv[1])['prepare']; "
+            "torch.set_grad_enabled(False); "
+            "q = torch.ones((1, 2, 256, 64), device='mps', dtype=torch.bfloat16); "
+            "attention = prepare(q, q, q); assert attention is not None; "
+            "out = attention(0, 128).float().cpu(); "
+            "assert torch.allclose(out, torch.ones_like(out))",
+            staging / loader,
+        ], check=True, cwd=staging, env={**os.environ, "CORRIDORKEY_MPS_NATIVE_ATTENTION": "1"})
+        build = source / "build"
+        (checkout / build).mkdir(exist_ok=True)
+        for name in ("mps_attention.so", "torch-version.txt"):
+            (staging / build / name).replace(checkout / build / name)
+
+
 if __name__ == "__main__":
     root = Path(sys.argv[1]).resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -169,4 +204,7 @@ if __name__ == "__main__":
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise SystemExit("Setup is already running in another Blender window.") from None
-        install(root)
+        if "--native-attention" in sys.argv[2:]:
+            build_native_attention(root)
+        else:
+            install(root)

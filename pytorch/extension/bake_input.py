@@ -10,13 +10,13 @@ import sys
 import bpy
 
 
-def set_png_format(settings, view_transform):
+def set_hint_format(settings):
     settings.file_format = "PNG"
     settings.color_mode = "RGB"
     settings.color_depth = "16"
     settings.display_settings.display_device = "sRGB"
     view = settings.view_settings
-    view.view_transform = view_transform
+    view.view_transform = "Raw"
     view.look = "None"
     view.exposure = 0
     view.gamma = 1
@@ -25,16 +25,12 @@ def set_png_format(settings, view_transform):
 
 
 def set_plate_format(settings, color_space):
-    if color_space is None:
-        set_png_format(settings, "Standard")
-        return ".png"
     settings.file_format = "OPEN_EXR"
     settings.color_mode = "RGB"
     settings.color_depth = "32"
     settings.linear_colorspace_settings.name = color_space
     if settings.linear_colorspace_settings.name != color_space:
-        raise ValueError(f"The color configuration must provide {color_space} for CUDA input.")
-    return ".exr"
+        raise ValueError(f"The color configuration must provide {color_space} for CorridorKey input.")
 
 
 def bake(config):
@@ -53,6 +49,8 @@ def bake(config):
     if context == "strip":
         editor = scene.sequence_editor
         strip = editor.strips[config["strip"]]
+        if hasattr(strip, "use_proxy"):
+            strip.use_proxy = False
         elements = getattr(strip, "elements", ())
         if elements and elements[0].orig_width and elements[0].orig_height:
             render.resolution_x = elements[0].orig_width
@@ -106,6 +104,10 @@ def bake(config):
         image_input = scale.inputs["Image"]
     hint = config.get("hint")
     if hint:
+        hint_path = Path(hint["path"])
+        hint_sequence = hint.get("every_frame", False)
+        if hint_sequence:
+            hint_path.mkdir()
         hint_node = tree.nodes[hint["node"]]
         hint_socket = next(socket for socket in hint_node.outputs if socket.identifier == hint["socket"])
         hint_value = tree.nodes.new("ShaderNodeMath")
@@ -133,8 +135,8 @@ def bake(config):
     # The project copy may be set to video, which only allows FFmpeg.
     settings.media_type = "IMAGE"
     settings.color_management = "OVERRIDE"
-    color_space = config.get("linear_color_space")
-    extension = set_plate_format(settings, color_space)
+    color_space = config["linear_color_space"]
+    set_plate_format(settings, color_space)
 
     destination = Path(config["destination"])
     destination.mkdir()
@@ -150,16 +152,17 @@ def bake(config):
             strip.transform.scale_x = strip.transform.scale_y = 1
             strip.transform.offset_x = strip.transform.offset_y = strip.transform.rotation = 0
             strip.crop.min_x = strip.crop.max_x = strip.crop.min_y = strip.crop.max_y = 0
-        output_path = destination / f"{index:06d}{extension}"
+        output_path = destination / f"{index:06d}.exr"
         render.filepath = str(output_path)
         bpy.ops.render.render(write_still=True, scene=scene.name)
-        if hint and index == 0:
+        if hint and (hint_sequence or index == 0):
+            matte_path = hint_path / f"{index:06d}.png" if hint_sequence else hint_path
             tree.links.new(hint_value.outputs[0], image_input)
-            set_png_format(settings, "Raw")
-            render.filepath = hint["path"]
+            set_hint_format(settings)
+            render.filepath = str(matte_path)
             bpy.ops.render.render(write_still=True, scene=scene.name)
-            if not Path(hint["path"]).is_file():
-                raise RuntimeError("Blender did not bake the first-frame matte hint.")
+            if not matte_path.is_file():
+                raise RuntimeError(f"Blender did not bake the matte hint for frame {frame}.")
             set_plate_format(settings, color_space)
             tree.links.new(source, image_input)
         if context == "strip":
@@ -167,11 +170,12 @@ def bake(config):
         if not output_path.is_file():
             raise RuntimeError(f"Blender did not bake frame {frame}.")
         print(f"Bake {index + 1}/{last - first + 1}", flush=True)
+
     if context == "strip":
-        print("Fitting baked frames to model resolution", flush=True)
+        print(f"Preparing native strip frames ({render.resolution_x} × {render.resolution_y})", flush=True)
         subprocess.run([
             config["python"], "-I", str(Path(__file__).with_name("fit_bake.py")),
-            str(destination), str(config["width"]), str(config["height"]),
+            str(destination), str(render.resolution_x), str(render.resolution_y),
             *([hint["path"]] if hint else []),
         ], input=json.dumps(quarter_turns), text=True, check=True)
 

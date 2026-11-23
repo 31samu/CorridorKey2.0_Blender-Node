@@ -5,27 +5,24 @@ import os
 from pathlib import Path
 import re
 import shutil
-import signal
 import subprocess
 import uuid
 
 import bpy
-from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
 from bpy.types import AddonPreferences, CompositorNodeCustomGroup, Operator
 
-from . import mlx_backend as backend
-from . import setup_ui
-from .sequences import FOREGROUND_OUTPUTS, KEYED_FRAMES, SEQUENCE_NODES
+from . import process_control, setup_ui, torch_backend
+from .sequences import KEYED_FRAMES, RAW_FOREGROUND, SEQUENCE_NODES
+from .torch_backend import BACKEND_NAME, USE_CUDA
 
 ADDON_ID = __package__
-NODE_ID = "CompositorNodeCorridorKeyMLX"
-NODE_LABEL = "CorridorKey2.0 (MLX)"
+NODE_ID = "CompositorNodeCorridorKeyMPS"
+NODE_LABEL = f"CorridorKey2.0 ({BACKEND_NAME})"
 JOBS = {}
 ANALYSIS_BUSY_MESSAGE = "Wait for analysis to finish."
-MORE_OUTPUTS = ("Matte", *FOREGROUND_OUTPUTS, "Edges")
+MORE_OUTPUTS = ("Matte", RAW_FOREGROUND, "Edges")
 ALPHA_HINT = "Alpha Hint"
-LEGACY_ALPHA_HINT = "Alpha Hint (first frame)"
 HINT_CONFIDENCE = "Alpha Hint Confidence"
 HINT_FRAMES = "Hint Frames"
 DESPILL_STRENGTH = "Despill Strength"
@@ -33,6 +30,13 @@ FIRST_FRAME = "First Frame"
 ALL_FRAMES = "All Frames"
 ANALYSIS_SETTINGS = "Analysis Settings"
 HINT_DESCRIPTION = "Rough alpha for Start Frame or every analyzed frame. A white overlay previews the hint."
+DEFAULT_HINT_CONFIDENCE = 0.95
+DEFAULT_DESPILL = 0.85
+TIME_AWARENESS_ITEMS = (
+    ("AUTO", "Automatic", "Use the largest frame window estimated to fit available GPU memory at this resolution"),
+    ("1", "Single Frame", "Use one frame per Stage 1 window"),
+    ("4", "Four Frames", "Use four-frame Stage 1 windows with a two-frame stride"),
+)
 GARBAGE_MASK = "Garbage Mask"
 PREVIEW_NODE = "Mask Preview"
 BAKE_PROGRESS = re.compile(rb"^Bake (\d+)/(\d+)$", re.MULTILINE)
@@ -107,11 +111,15 @@ def bake_cache_directory(tree):
     if not isinstance(destination, str) or Path(destination).parts[-2:] != (job.name, "baked-input"):
         return None
 
-    for sequence in backend.output_sequences(result):
-        image = tree.nodes[sequence.node_name].image
+    expected = {
+        (sequence.node_name, sequence.folder, sequence.extension)
+        for sequence in torch_backend.output_sequences(result)
+    }
+    for name in SEQUENCE_NODES:
+        image = tree.nodes[name].image
         if image:
             path = image_path(image)
-            if path.parent != sequence.folder or path.suffix != sequence.extension:
+            if (name, path.parent, path.suffix) not in expected:
                 return None
     return job
 
@@ -119,8 +127,14 @@ def bake_cache_directory(tree):
 class CorridorKeyPreferences(AddonPreferences):
     bl_idname = ADDON_ID
 
-    executable: StringProperty(name="MLX executable", subtype="FILE_PATH")
-    model_root: StringProperty(name="FP16 model folder", subtype="DIR_PATH")
+    runtime_python: StringProperty(name=f"{BACKEND_NAME} Python", subtype="FILE_PATH")
+    runtime_checkout: StringProperty(name="CorridorKey 2.0 folder", subtype="DIR_PATH")
+    runtime_ffmpeg: StringProperty(name="FFmpeg executable", subtype="FILE_PATH", description="Optional when FFmpeg is on PATH")
+    native_attention: BoolProperty(
+        name="Use Native MPSGraph Attention",
+        description="Use the optional native attention library when available",
+        default=False,
+    )
     cache_root: StringProperty(name="Cache folder", subtype="DIR_PATH")
     delete_cache_on_clear: BoolProperty(
         name="Delete Cache Files on Clear Bake",
@@ -128,44 +142,91 @@ class CorridorKeyPreferences(AddonPreferences):
         default=False,
     )
     show_advanced: BoolProperty(name="Advanced", default=False)
+    show_custom_paths: BoolProperty(name="Custom Paths", default=False)
+    exr_dtype: EnumProperty(
+        name="EXR Precision",
+        description="Precision of the cutout and raw foreground files in new bakes",
+        items=(
+            ("half", "16-bit Float", "Use half-float EXRs for smaller bake caches"),
+            ("float", "32-bit Float", "Use full-float EXRs to retain more precision"),
+        ),
+        default="half",
+    )
+    default_temporal: EnumProperty(
+        name="Time Awareness", items=TIME_AWARENESS_ITEMS, default="AUTO",
+    )
+    default_larger_batches: BoolProperty(
+        name="Larger Batches",
+        description="Use larger internal batches for manual frame windows on new nodes",
+        default=False,
+    )
+    default_despill_strength: FloatProperty(
+        name=DESPILL_STRENGTH, subtype="FACTOR", default=DEFAULT_DESPILL, min=0.0, max=1.0,
+    )
+    default_hint_confidence: FloatProperty(
+        name=HINT_CONFIDENCE, subtype="FACTOR", default=DEFAULT_HINT_CONFIDENCE, min=0.0, max=1.0,
+    )
+    default_hint_frames: EnumProperty(
+        name=HINT_FRAMES,
+        items=(
+            ("FIRST", FIRST_FRAME, "Sample the hint at Start Frame"),
+            ("ALL", ALL_FRAMES, "Sample the hint at every analyzed frame"),
+        ),
+        default="FIRST",
+    )
 
     def draw(self, context):
         layout = self.layout
         setup_ui.draw_setup(layout, self)
+        defaults = layout.box()
+        defaults.label(text="Node Defaults")
+        defaults.prop(self, "default_temporal")
+        if not USE_CUDA:
+            batches = defaults.row()
+            batches.enabled = self.default_temporal != "AUTO"
+            batches.prop(self, "default_larger_batches")
+        defaults.prop(self, "default_despill_strength", slider=True)
+        defaults.prop(self, "default_hint_confidence", slider=True)
+        defaults.prop(self, "default_hint_frames")
+        layout.prop(self, "delete_cache_on_clear")
+
         row = layout.row(align=True)
         row.alignment = "LEFT"
         row.prop(self, "show_advanced", emboss=False, icon="TRIA_DOWN" if self.show_advanced else "TRIA_RIGHT")
         if self.show_advanced:
-            layout.prop(self, "executable")
-            layout.prop(self, "model_root")
-            layout.prop(self, "cache_root")
-            layout.prop(self, "delete_cache_on_clear")
+            if not USE_CUDA:
+                setup_ui.draw_native_attention(layout, self)
+            layout.prop(self, "exr_dtype")
+            paths = layout.box()
+            row = paths.row(align=True)
+            row.alignment = "LEFT"
+            row.prop(self, "show_custom_paths", emboss=False, icon="TRIA_DOWN" if self.show_custom_paths else "TRIA_RIGHT")
+            if self.show_custom_paths:
+                paths.prop(self, "runtime_python")
+                paths.prop(self, "runtime_checkout")
+                paths.prop(self, "runtime_ffmpeg")
+                paths.prop(self, "cache_root")
 
 
 class CorridorKeyNode(CompositorNodeCustomGroup):
     bl_idname = NODE_ID
     bl_label = NODE_LABEL
 
-    screen: EnumProperty(
-        name="Screen",
-        items=backend.SCREEN_ITEMS,
+    temporal: EnumProperty(
+        name="Time Awareness", default="AUTO",
+        description="How many neighboring frames the first stage processes together",
+        items=TIME_AWARENESS_ITEMS,
+    )
+    larger_batches: BoolProperty(
+        name="Larger Batches",
+        description="Use larger internal batches for manual frame windows. This can speed up analysis and uses more memory",
+        default=False,
     )
     start_frame: IntProperty(name="Start Frame", default=1, update=set_start_frame)
     bake_end: IntProperty(name="End Frame", default=1)
-    profile: EnumProperty(
-        name="Model resolution",
-        items=backend.PROFILE_ITEMS,
-    )
-    # Keep the RNA properties so Blender can load and migrate the earlier build's settings.
-    alpha_hint_confidence: FloatProperty(default=0.8, min=0.0, max=1.0, options={"HIDDEN"})
-    alpha_hint_mode: EnumProperty(
-        items=(("FIRST", FIRST_FRAME, ""), ("ALL", ALL_FRAMES, "")),
-        default="FIRST", options={"HIDDEN"},
-    )
-    despill_strength: FloatProperty(default=1.0, min=0.0, max=1.0, options={"HIDDEN"})
     status: StringProperty()
 
-    def init(self, context):
+    def init(self, _context):
         tree = bpy.data.node_groups.new("CorridorKey2.0", "CompositorNodeTree")
         tree.color_tag = "MATTE"
         image_input = tree.interface.new_socket(name="Image", in_out="INPUT", socket_type="NodeSocketColor")
@@ -181,7 +242,15 @@ class CorridorKeyNode(CompositorNodeCustomGroup):
         add_mask_preview(tree)
         update_image_output(tree)
         self.node_tree = tree
-        self.inputs[HINT_FRAMES].default_value = FIRST_FRAME
+        hint_frames = FIRST_FRAME
+        if addon := bpy.context.preferences.addons.get(ADDON_ID):
+            prefs = addon.preferences
+            self.temporal = prefs.default_temporal
+            self.larger_batches = not USE_CUDA and prefs.default_larger_batches
+            self.inputs[DESPILL_STRENGTH].default_value = prefs.default_despill_strength
+            self.inputs[HINT_CONFIDENCE].default_value = prefs.default_hint_confidence
+            hint_frames = ALL_FRAMES if prefs.default_hint_frames == "ALL" else FIRST_FRAME
+        self.inputs[HINT_FRAMES].default_value = hint_frames
         self.outputs[ANALYSIS_SETTINGS].hide = True
         self.width = 245
 
@@ -204,20 +273,21 @@ class CorridorKeyNode(CompositorNodeCustomGroup):
         fields = layout.column()
         fields.enabled = job is None and not baked
         linked = image_is_linked(self)
-        for property_name, label in (("screen", "Screen"), ("profile", "Model resolution")):
-            field = fields.split(factor=0.52, align=True)
-            field.label(text=label)
-            field.prop(self, property_name, text="")
+        temporal = fields.split(factor=0.55, align=True)
+        temporal.label(text="Time Awareness")
+        temporal.prop(self, "temporal", text="")
+        if not USE_CUDA and self.temporal != "AUTO":
+            fields.prop(self, "larger_batches")
         fields.prop(self, "start_frame")
         fields.prop(self, "bake_end")
         if job:
-            layout.operator("node.corridorkey_mlx_cancel", text="Cancel").node_name = self.name
+            layout.operator("node.corridorkey_mps_cancel", text="Cancel").node_name = self.name
             if job.progress is None:
                 layout.label(text=job.message)
             else:
                 layout.progress(factor=job.progress, type="BAR", text=job.message)
         elif baked:
-            layout.operator("node.corridorkey_mlx_clear_bake", text="Clear Bake").node_name = self.name
+            layout.operator("node.corridorkey_mps_clear_bake", text="Clear Bake").node_name = self.name
             if self.status:
                 layout.label(text=self.status)
         else:
@@ -225,7 +295,7 @@ class CorridorKeyNode(CompositorNodeCustomGroup):
             row = layout.row()
             row.enabled = linked and not busy
             row.operator(
-                "node.corridorkey_mlx_analyze",
+                "node.corridorkey_mps_analyze",
                 text=ANALYSIS_BUSY_MESSAGE if busy else "Analyze",
             ).node_name = self.name
             if self.status and not busy:
@@ -243,7 +313,6 @@ def add_processing_sockets(tree):
         socket.hide_value = True
         socket.default_value = 1 if name == GARBAGE_MASK else 0
     for name, socket_type in (
-        ("Despilled Foreground", "NodeSocketColor"),
         ("Raw Foreground", "NodeSocketColor"),
         ("Edges", "NodeSocketFloat"),
     ):
@@ -281,10 +350,9 @@ def add_processing_sockets(tree):
         links.new(boundary.outputs["Mask"], edges.inputs[index])
     links.new(edges.outputs[0], output.inputs["Edges"])
 
-    for name in FOREGROUND_OUTPUTS:
-        foreground = nodes.new("CompositorNodeImage")
-        foreground.name = name
-        links.new(foreground.outputs["Image"], output.inputs[name])
+    foreground = nodes.new("CompositorNodeImage")
+    foreground.name = RAW_FOREGROUND
+    links.new(foreground.outputs["Image"], output.inputs[RAW_FOREGROUND])
 
 
 def organize_sockets(tree):
@@ -293,21 +361,12 @@ def organize_sockets(tree):
         (item.in_out, item.name): item for item in interface.items_tree
         if item.item_type == "SOCKET"
     }
-    panel = interface.new_panel("More", default_closed=True)
+    more = interface.new_panel("More", default_closed=True)
     for index, name in enumerate(MORE_OUTPUTS):
-        interface.move_to_parent(sockets["OUTPUT", name], panel, index)
-    interface.move_to_parent(sockets["INPUT", ALPHA_HINT], panel, len(MORE_OUTPUTS))
+        interface.move_to_parent(sockets["OUTPUT", name], more, index)
+    interface.move_to_parent(sockets["INPUT", ALPHA_HINT], more, len(MORE_OUTPUTS))
     add_analysis_controls(tree, sockets["INPUT", ALPHA_HINT])
-    fold_more_panel(interface)
-
-
-def fold_more_panel(interface):
-    more = interface.items_tree.get("More")
-    if more is None:
-        return
     items = {item.name: item for item in more.interface_items}
-    if "Additional Outputs" in items:
-        return
     for label, names in (
         ("Additional Outputs", (*MORE_OUTPUTS, ANALYSIS_SETTINGS)),
         ("Alpha Hint Settings", (ALPHA_HINT, HINT_CONFIDENCE, HINT_FRAMES)),
@@ -321,26 +380,21 @@ def fold_more_panel(interface):
 def add_analysis_controls(tree, hint):
     interface = tree.interface
     for offset, (name, default, description) in enumerate((
-        (HINT_CONFIDENCE, 0.8, "How strongly the model follows Alpha Hint during analysis"),
+        (HINT_CONFIDENCE, DEFAULT_HINT_CONFIDENCE, "How strongly the model follows Alpha Hint during analysis"),
         (HINT_FRAMES, None, "Sample the hint at Start Frame or at every analyzed frame"),
-        (DESPILL_STRENGTH, 1.0, "How much green or blue spill to remove during analysis. Clear the bake to change it."),
+        (DESPILL_STRENGTH, DEFAULT_DESPILL, "How much green spill to remove during analysis. Clear the bake to change it."),
     ), start=1):
-        socket = interface.items_tree.get(name)
-        if socket is None:
-            socket = interface.new_socket(
-                name=name, in_out="INPUT",
-                socket_type="NodeSocketMenu" if default is None else "NodeSocketFloat",
-                description=description,
-            )
-            if default is not None:
-                socket.subtype = "FACTOR"
-                socket.min_value = 0.0
-                socket.max_value = 1.0
-                socket.default_value = default
+        socket = interface.new_socket(
+            name=name, in_out="INPUT",
+            socket_type="NodeSocketMenu" if default is None else "NodeSocketFloat",
+            description=description,
+        )
+        if default is not None:
+            socket.subtype = "FACTOR"
+            socket.min_value = 0.0
+            socket.max_value = 1.0
+            socket.default_value = default
         interface.move_to_parent(socket, hint.parent, hint.position + offset)
-
-    if old_mode := interface.items_tree.get("Hint Every Frame"):
-        interface.remove(old_mode)
 
     # Connect the bake options to a private output so Blender keeps their
     # native controls active without routing their values into the image.
@@ -364,45 +418,6 @@ def add_analysis_controls(tree, hint):
     links.new(menu.outputs[0], settings.inputs["Y"])
     links.new(group_input.outputs[DESPILL_STRENGTH], settings.inputs["Z"])
     links.new(settings.outputs[0], group_output.inputs[ANALYSIS_SETTINGS])
-
-
-@persistent
-def upgrade_analysis_controls(_unused=None):
-    old_nodes = []
-    groups = set()
-    for tree in bpy.data.node_groups:
-        if tree.bl_idname != "CompositorNodeTree" or not tree.is_editable:
-            continue
-        for node in tree.nodes:
-            if node.bl_idname != NODE_ID or not node.node_tree or not node.node_tree.is_editable:
-                continue
-            groups.add(node.node_tree)
-            if node.outputs.get(ANALYSIS_SETTINGS) is None:
-                old_nodes.append((
-                    node,
-                    socket_setting(node, HINT_CONFIDENCE, node.alpha_hint_confidence),
-                    socket_setting(node, "Hint Every Frame", node.alpha_hint_mode == "ALL"),
-                    socket_setting(node, DESPILL_STRENGTH, node.despill_strength),
-                ))
-    for node, confidence, every_frame, despill in old_nodes:
-        group = node.node_tree
-        if node.outputs.get(ANALYSIS_SETTINGS) is None:
-            interface = group.interface
-            hint = interface.items_tree.get(ALPHA_HINT) or interface.items_tree.get(LEGACY_ALPHA_HINT)
-            if hint is None or hint.parent is None:
-                continue
-            hint.name = ALPHA_HINT
-            hint.description = HINT_DESCRIPTION
-            hint.parent.name = "More"
-            add_analysis_controls(group, hint)
-        node.inputs[HINT_CONFIDENCE].default_value = confidence
-        node.inputs[HINT_FRAMES].default_value = ALL_FRAMES if every_frame else FIRST_FRAME
-        node.inputs[DESPILL_STRENGTH].default_value = despill
-        node.outputs[ANALYSIS_SETTINGS].hide = True
-    for group in groups:
-        if group.interface.items_tree.get(ANALYSIS_SETTINGS) is not None:
-            fold_more_panel(group.interface)
-            sync_analysis_controls(group)
 
 
 def add_preview_mix(tree, label):
@@ -451,13 +466,7 @@ def update_image_output(tree):
     keyed = tree.nodes[KEYED_FRAMES]
     output = next(node for node in tree.nodes if node.type == "GROUP_OUTPUT" and node.is_active_output)
     image_input = output.inputs["Image"]
-    if keyed.image:
-        source = tree.nodes["Masked Image"].outputs["Image"]
-    elif preview := tree.nodes.get(PREVIEW_NODE):
-        source = preview.outputs["Image"]
-    else:
-        group_input = next(node for node in tree.nodes if node.type == "GROUP_INPUT")
-        source = group_input.outputs["Image"]
+    source = tree.nodes["Masked Image" if keyed.image else PREVIEW_NODE].outputs["Image"]
     if not any(link.from_socket == source for link in image_input.links):
         tree.links.new(source, image_input)
     sync_analysis_controls(tree)
@@ -480,10 +489,6 @@ def sync_analysis_controls(tree):
     )
     if settings is None:
         return
-    # Previously saved bakes may have disconnected just the despill input.
-    if not settings.inputs["Z"].is_linked:
-        group_input = next(node for node in tree.nodes if node.type == "GROUP_INPUT")
-        tree.links.new(group_input.outputs[DESPILL_STRENGTH], settings.inputs["Z"])
     if not target.is_linked:
         tree.links.new(settings.outputs[0], target)
 
@@ -502,15 +507,10 @@ def image_is_linked(node):
     return image_input_link(node) is not None
 
 
-def socket_setting(node, name, default):
-    socket = node.inputs.get(name)
-    return socket.default_value if socket is not None else default
-
-
-def analysis_setting(node, name, default):
+def analysis_setting(node, name):
     if image_input_link(node, socket_name=name):
         raise ValueError(f"Disconnect the {name} input and set it under More.")
-    return socket_setting(node, name, default)
+    return node.inputs[name].default_value
 
 
 def strip_compositor(scene, tree):
@@ -566,19 +566,18 @@ def bake_config(context, node, destination, bake_size):
     last = node.bake_end
     if last < node.start_frame:
         raise ValueError("End Frame must be at or after Start Frame.")
-    width, height = bake_size
     config = {
         "scene": scene.name, "node": node.name, "first": node.start_frame,
-        "last": last, "width": width, "height": height,
+        "last": last,
         "destination": str(destination / "baked-input"),
         "source_node": link.from_node.name,
         "source_socket": link.from_socket.identifier,
-        "despill_strength": analysis_setting(node, DESPILL_STRENGTH, 1.0),
+        "despill_strength": analysis_setting(node, DESPILL_STRENGTH),
     }
-    hint = image_input_link(node, socket_name=ALPHA_HINT) or image_input_link(node, socket_name=LEGACY_ALPHA_HINT)
-    confidence = analysis_setting(node, HINT_CONFIDENCE, 0.8) if hint else 0.0
+    hint = image_input_link(node, socket_name=ALPHA_HINT)
+    confidence = analysis_setting(node, HINT_CONFIDENCE) if hint else 0.0
     if confidence > 0:
-        every_frame = analysis_setting(node, HINT_FRAMES, FIRST_FRAME) == ALL_FRAMES
+        every_frame = analysis_setting(node, HINT_FRAMES) == ALL_FRAMES
         config["hint"] = {
             "node": hint.from_node.name,
             "socket": hint.from_socket.identifier,
@@ -593,6 +592,7 @@ def bake_config(context, node, destination, bake_size):
         if not strip.frame_final_start <= node.start_frame <= last < strip.frame_final_end:
             raise ValueError("Set Start and End Frame inside the selected strip.")
         return dict(config, context="strip", strip=strip.name, effect=modifier.name)
+    config["width"], config["height"] = bake_size
     for index, effect in enumerate(scene.compositor_effects):
         if effect.node_group == tree:
             return dict(config, context="effect", effect=index)
@@ -607,8 +607,29 @@ def get_node(context, name):
     return node if node and node.bl_idname == NODE_ID else None
 
 
+def prepare_analysis(context, node, prefs, destination):
+    python, checkout, ffmpeg = setup_ui.analysis_paths(prefs)
+    torch_backend.validate_runtime(python, checkout, ffmpeg)
+    render = context.scene.render
+    percent = render.resolution_percentage
+    bake_size = (max(4, render.resolution_x * percent // 100), max(4, render.resolution_y * percent // 100))
+    config = bake_config(context, node, destination, bake_size)
+    if config["context"] == "strip":
+        if USE_CUDA:
+            raise ValueError("Use the scene compositor for CUDA analysis. Sequencer strip compositing requires MPS.")
+        config["python"] = str(python)
+    config["linear_color_space"] = torch_backend.LINEAR_COLOR_SPACE
+    config["exr_dtype"] = prefs.exr_dtype
+    config["time_awareness"] = node.temporal
+    config["larger_batches"] = not USE_CUDA and node.temporal != "AUTO" and node.larger_batches
+    config["native_attention"] = not USE_CUDA and prefs.native_attention
+    output = destination / "result"
+    command = torch_backend.analysis_command(python, checkout, ffmpeg, config, output, render.fps / render.fps_base)
+    return config, command, torch_backend.output_sequences(output)
+
+
 class CorridorKeyAnalyze(Operator):
-    bl_idname = "node.corridorkey_mlx_analyze"
+    bl_idname = "node.corridorkey_mps_analyze"
     bl_label = "Analyze with CorridorKey"
     bl_description = "Analyze the connected image and bake the keyed frames"
 
@@ -632,17 +653,9 @@ class CorridorKeyAnalyze(Operator):
         self.process = None
         self.snapshot = None
         try:
-            executable, model_root = setup_ui.analysis_paths(prefs)
-            backend.validate_runtime(executable, model_root, node.profile)
             destination = cache_root(prefs) / uuid.uuid4().hex
-            config = bake_config(context, node, destination, backend.bake_size(node.profile))
-            if config["context"] == "strip":
-                config["python"] = str(backend.geometry_python(executable))
-            output = destination / "result"
-            self.sequences = backend.output_sequences(output)
-            self.analysis_command = backend.analysis_command(
-                executable, model_root, config, output, node.screen, node.profile,
-            )
+            config, self.analysis_command, self.sequences = prepare_analysis(context, node, prefs, destination)
+            self.native_attention = config["native_attention"]
             destination.mkdir(parents=True)
             self.destination = destination
             self.log = destination / "analysis.log"
@@ -682,10 +695,13 @@ class CorridorKeyAnalyze(Operator):
         return {"RUNNING_MODAL"}
 
     def launch(self, command):
+        env = os.environ.copy()
+        if not USE_CUDA and not self.baking:
+            env["CORRIDORKEY_MPS_NATIVE_ATTENTION"] = "1" if self.native_attention else "0"
         with self.log.open("ab") as log:
             self.process = subprocess.Popen(
-                command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
-                cwd=self.destination,
+                command, stdout=log, stderr=subprocess.STDOUT, cwd=self.destination,
+                env=env, **process_control.launch_options(),
             )
 
     def remove_snapshot(self):
@@ -697,10 +713,7 @@ class CorridorKeyAnalyze(Operator):
 
     def request_cancel(self):
         self.cancelled = True
-        try:
-            os.killpg(self.process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        process_control.stop(self.process)
 
     def modal(self, context, event):
         if event.type != "TIMER":
@@ -734,7 +747,7 @@ class CorridorKeyAnalyze(Operator):
                 matches = BAKE_PROGRESS.findall(data)
                 progress = (1, "Baking input", *map(int, matches[-1])) if matches else None
             else:
-                progress = backend.read_progress(data)
+                progress = torch_backend.read_progress(data)
             if progress is not None:
                 step, label, current, total = progress
                 self.progress = min(current / max(total, 1), 1.0)
@@ -783,7 +796,7 @@ class CorridorKeyAnalyze(Operator):
 
 
 class CorridorKeyCancel(Operator):
-    bl_idname = "node.corridorkey_mlx_cancel"
+    bl_idname = "node.corridorkey_mps_cancel"
     bl_label = "Cancel CorridorKey analysis"
 
     node_name: StringProperty()
@@ -797,7 +810,7 @@ class CorridorKeyCancel(Operator):
 
 
 class CorridorKeyClearBake(Operator):
-    bl_idname = "node.corridorkey_mlx_clear_bake"
+    bl_idname = "node.corridorkey_mps_clear_bake"
     bl_label = "Clear Bake"
     bl_description = "Clear this node's bake and return to the source preview. See preferences for cache deletion"
     bl_options = {"UNDO"}
@@ -862,8 +875,6 @@ def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
     bpy.types.NODE_MT_category_compositor_keying.append(draw_keying_menu)
-    bpy.app.handlers.load_post.append(upgrade_analysis_controls)
-    bpy.app.timers.register(upgrade_analysis_controls, first_interval=0)
 
 
 def unregister():
@@ -872,8 +883,5 @@ def unregister():
     for job in tuple(JOBS.values()):
         job.cancel(None)
     bpy.types.NODE_MT_category_compositor_keying.remove(draw_keying_menu)
-    bpy.app.handlers.load_post.remove(upgrade_analysis_controls)
-    if bpy.app.timers.is_registered(upgrade_analysis_controls):
-        bpy.app.timers.unregister(upgrade_analysis_controls)
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)

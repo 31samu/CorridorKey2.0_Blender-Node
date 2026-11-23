@@ -12,12 +12,18 @@ Blender 5.3.0, source frames 17–32 of `pink-outfit-720p.mp4`, at 25 fps in the
 | MPS 0.5.1 · mixed BF16 | No · 1 frame, stride 1 | 98.42 s | 6.15 s | 95.86 s | 7.41 GiB |
 | MPS 0.5.1 · mixed BF16 | Yes · 4 frames, stride 2 | 98.43 s | 6.15 s | 93.86 s | 7.46 GiB |
 | MPS 0.5.1 · mixed BF16 with native MPSGraph attention | No · 1 frame, stride 1 | 85.69 s | 5.36 s | 83.30 s | 7.41 GiB |
+| MPS 0.5.2 · mixed BF16 with Larger Batches | No · 1 frame, stride 1 | 85.45 s | 5.34 s | 82.97 s | 7.42 GiB |
+| MPS 0.5.2 · mixed BF16 with Larger Batches and native MPSGraph attention | No · 1 frame, stride 1 | 80.61 s | 5.04 s | 78.30 s | 7.41 GiB |
 
 Stock single-frame MPS took 3.37× as long as MLX in Blender. Four-frame MPS took effectively the same time as single-frame MPS on this clip. Native MPSGraph attention cut single-frame Analyze time by 12.9% with the same peak footprint to two decimal places.
+
+In 0.5.2, Larger Batches reduced the single-frame median by 13.2% from the stock 0.5.1 run. Both options together reduced it by 18.1%. The fastest MPS run configuration still took 2.76× as long as MLX. The 0.5.2 runs used the same benchmark in a separate session. The warm-ups took 114.88 s with Larger Batches and 124.22 s with both options.
 
 Each median uses three timed bakes after one warm-up. Backend wall time includes model loading and output writes. Peak backend footprint is the highest macOS `time -l` peak memory footprint among the three timed backend processes. MLX wrote cutout, despilled foreground, and raw foreground as 16-bit PNGs. MPS used PyTorch 2.9.1 and wrote cutout and raw foreground as EXRs. The MLX backend reports its 24 fps default for PNG sequences even though the Blender scene ran at 25 fps. All comparisons use the same numbered source frames.
 
 The optional MPSGraph kernel was built in a scratch checkout with the same model files and batch sizes as stock single-frame MPS. All four bakes completed and logged that native attention was enabled. The logs also printed `Failed to import MPS module`. In the two median-time single-frame runs, the absolute alpha difference averaged 0.00035 on a 0–1 scale. About 0.026% of pixels differed by more than 0.10.
+
+The 0.5.2 preset raised full-attention query chunks from 128 to 512 tokens, Swin batches from 1 to 4, and MLP chunks from 4,096 to 16,384 tokens. Compared with the median stock MPS run, mean absolute alpha differences were 0.00021 with Larger Batches and 0.00038 with both options. One pixel differed by more than 0.10 with Larger Batches alone. With both options, 0.029% of pixels exceeded that threshold.
 
 ### Earlier measurements
 
