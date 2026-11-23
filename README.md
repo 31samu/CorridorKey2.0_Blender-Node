@@ -9,9 +9,11 @@ This extension was made using AI, if you want to stay away from anything related
 Apple Silicon is supported and tested, using a [MLX port](https://github.com/peterteravskis/corridorkey-v2-mlx) by Peter Teravskis.\
 [-> Download for Apple Silicon](UNZIPME.zip?raw=true)
 
-Windows/Nvidea is experimental and still untested (please test):
-[experimental, outdated windows/nvidea extension download](experimental/corridorkey_compositor-0.3.18-experimental.3.zip?raw=true)
-->[more information](experimental/README.md)
+Windows/Nvidea is experimental and still untested (please test):\
+[-> Download experimental, windows/nvidia extension ](experimentalNVIDIA0.3.x/corridorkey_compositor-0.3.18-experimental.3.zip?raw=true)\
+[more info](experimentalNVIDIA0.3.x/README.md)
+
+Also see the [experimental MPS build](0.5.xMPS/README.md) (at the moment not very performant).\ [Performance measurements](performance.md) record local timings and memory use.
 
 ### specifics
 
